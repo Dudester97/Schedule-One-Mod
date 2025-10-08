@@ -1,0 +1,322 @@
+// NotificationBlocker.cs
+// Battery-aware notification buffer with batched flush (6 at a time),
+// waiting until all active popups finish before sending the next batch.
+// Also hides HUD/UnreadMessagePrompt while battery is 0%.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
+using MelonLoader;
+using UnityEngine;
+using UnityEngine.UI;
+
+// Game namespaces
+using ScheduleOne.DevUtilities;      // Singleton<T>
+using ScheduleOne.UI;                // HUD, NotificationsManager
+using ScheduleOne.PhoneBattery;           // PhoneBattery, PhoneBatteryComponent
+
+namespace ScheduleOne.PhoneBattery
+{
+    public static class NotificationBlocker
+    {
+        private static bool _initialized;
+        private static HarmonyLib.Harmony _harmony;
+
+        public static void Init()
+        {
+            if (_initialized) return;
+            _initialized = true;
+
+            try
+            {
+                _harmony = new HarmonyLib.Harmony("ScheduleOne.PhoneBattery.NotificationBlocker");
+                _harmony.PatchAll(typeof(NotificationBlocker).Assembly);
+                NotificationBlockerController.EnsureExists();
+                MelonLogger.Msg("[NotificationBlocker] Initialized (batched flush enabled).");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error("[NotificationBlocker] Init failed: " + ex);
+                _initialized = false;
+            }
+        }
+    }
+
+    internal struct BufferedNotification
+    {
+        public string Title;
+        public string Subtitle;
+        public Sprite Icon;
+        public float Duration;
+        public bool PlaySound;
+    }
+
+    internal sealed class NotificationBlockerController : MonoBehaviour
+    {
+        private const int MAX_ONSCREEN = 6;
+
+        private static GameObject _hostGO;
+        private static readonly List<BufferedNotification> _buffer = new List<BufferedNotification>(64);
+
+        private static bool _wasDead;
+        private static bool _batchFlushing;
+
+        // Reflection caches
+        private static FieldInfo _fiCoroutines;       // private Dictionary<RectTransform, Coroutine> coroutines
+        private static FieldInfo _fiEntryContainer;   // RectTransform EntryContainer (if not public, grab by reflection)
+        private static bool _reflectionTried;
+
+        public static void EnsureExists()
+        {
+            if (_hostGO != null) return;
+
+            _hostGO = new GameObject("NotificationBlocker");
+            DontDestroyOnLoad(_hostGO);
+            _hostGO.hideFlags = HideFlags.HideAndDontSave;
+            _hostGO.AddComponent<NotificationBlockerController>();
+
+            MelonLogger.Msg("[NotificationBlocker] Controller created.");
+        }
+
+        private void Update()
+        {
+            bool isDead = PhoneBattery.CurrentBatteryLevel <= 0.0f + 0.0001f;
+
+            // Hide/show UnreadMessagePrompt based on battery state
+            TrySetUnreadPromptActive(!isDead);
+
+            // On DEAD -> ALIVE transition, start a batched flush
+            if (!isDead && _wasDead)
+            {
+                TryStartBatchFlush();
+            }
+
+            _wasDead = isDead;
+        }
+
+        public static void Buffer(string title, string subtitle, Sprite icon, float duration, bool playSound)
+        {
+            _buffer.Add(new BufferedNotification
+            {
+                Title = title,
+                Subtitle = subtitle,
+                Icon = icon,
+                Duration = duration,
+                PlaySound = playSound
+            });
+        }
+
+        public static bool ShouldBlockNow()
+        {
+            return PhoneBattery.CurrentBatteryLevel <= 0.0f + 0.0001f;
+        }
+
+        // ---- Batch flush orchestration ----
+
+        private void TryStartBatchFlush()
+        {
+            if (_batchFlushing) return;
+            if (_buffer.Count == 0) return;
+
+            StartCoroutine(BatchFlushCoroutine());
+        }
+
+        private IEnumerator BatchFlushCoroutine()
+        {
+            _batchFlushing = true;
+            MelonLogger.Msg($"[NotificationBlocker] Starting batched flush. Buffered: {_buffer.Count}");
+
+            while (_buffer.Count > 0)
+            {
+                // If phone dies mid-flush, stop and leave remaining in buffer
+                if (ShouldBlockNow())
+                {
+                    MelonLogger.Msg("[NotificationBlocker] Flush paused (battery died again).");
+                    break;
+                }
+
+                // Ensure manager exists
+                if (!Singleton<NotificationsManager>.InstanceExists || Singleton<NotificationsManager>.Instance == null)
+                {
+                    // Wait and retry next frame
+                    yield return null;
+                    continue;
+                }
+
+                var mgr = Singleton<NotificationsManager>.Instance;
+
+                // Determine how many we can show this wave
+                int active = GetActiveToastCount(mgr);
+                int available = Mathf.Clamp(MAX_ONSCREEN - active, 0, MAX_ONSCREEN);
+                if (available == 0)
+                {
+                    // Wait until current wave fully finishes
+                    yield return WaitUntilNoActiveToasts(mgr);
+                    continue;
+                }
+
+                int toSend = Mathf.Min(available, _buffer.Count);
+
+                // Send this wave; yield once between each to ease layout churn
+                for (int i = 0; i < toSend; i++)
+                {
+                    var n = _buffer[0];
+                    _buffer.RemoveAt(0);
+                    mgr.SendNotification(n.Title, n.Subtitle, n.Icon, n.Duration, n.PlaySound);
+                    yield return null; // helps avoid layout race with the 6-cap culling
+                }
+
+                // Now wait for all on-screen to finish before the next wave
+                yield return WaitUntilNoActiveToasts(mgr);
+            }
+
+            MelonLogger.Msg("[NotificationBlocker] Batched flush complete.");
+            _batchFlushing = false;
+        }
+
+        private IEnumerator WaitUntilNoActiveToasts(NotificationsManager mgr)
+        {
+            // Defensive timeout in case something goes wrong (e.g., a toast never ends)
+            const float hardTimeout = 15f; // seconds per wave
+            float t = 0f;
+            while (GetActiveToastCount(mgr) > 0 && t < hardTimeout)
+            {
+                // If battery dies while waiting, break early (remaining will stay buffered)
+                if (ShouldBlockNow())
+                    yield break;
+
+                t += Time.unscaledDeltaTime;
+                yield return null;
+            }
+        }
+
+        // ---- Active toast counting (reflection + fallback) ----
+
+        private int GetActiveToastCount(NotificationsManager mgr)
+        {
+            TryCacheReflection();
+
+            // Preferred: private coroutines dictionary count
+            if (_fiCoroutines != null)
+            {
+                try
+                {
+                    var obj = _fiCoroutines.GetValue(mgr) as System.Collections.IDictionary;
+                    if (obj != null)
+                        return obj.Count;
+                }
+                catch { /* fallback below */ }
+            }
+
+            // Fallback: EntryContainer child count (active popups under the container)
+            var container = GetEntryContainer(mgr);
+            if (container != null)
+                return container.childCount;
+
+            // Last resort: assume 0 active
+            return 0;
+        }
+
+        private RectTransform GetEntryContainer(NotificationsManager mgr)
+        {
+            // Direct field (reflected)
+            if (_fiEntryContainer != null)
+            {
+                try
+                {
+                    var val = _fiEntryContainer.GetValue(mgr) as RectTransform;
+                    if (val != null) return val;
+                }
+                catch { /* search by name below */ }
+            }
+
+            // Search by common names in children
+            var rts = mgr.GetComponentsInChildren<RectTransform>(true);
+            for (int i = 0; i < rts.Length; i++)
+            {
+                var rt = rts[i];
+                if (rt == null) continue;
+                string nm = rt.gameObject.name;
+                if (nm.Equals("EntryContainer", StringComparison.OrdinalIgnoreCase) ||
+                    nm.Equals("NotificationsContainer", StringComparison.OrdinalIgnoreCase) ||
+                    nm.Equals("NotificationContainer", StringComparison.OrdinalIgnoreCase))
+                    return rt;
+            }
+            return null;
+        }
+
+        private void TryCacheReflection()
+        {
+            if (_reflectionTried) return;
+            _reflectionTried = true;
+
+            try
+            {
+                var t = typeof(NotificationsManager);
+                _fiCoroutines = t.GetField("coroutines", BindingFlags.Instance | BindingFlags.NonPublic);
+                _fiEntryContainer = t.GetField("EntryContainer", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Msg($"[NotificationBlocker] Reflection probe failed (non-fatal): {ex.Message}");
+            }
+        }
+
+        // ---- HUD unread prompt toggling ----
+
+        private static void TrySetUnreadPromptActive(bool active)
+        {
+            try
+            {
+                if (!Singleton<HUD>.InstanceExists) return;
+                var hud = Singleton<HUD>.Instance;
+                if (hud == null) return;
+
+                var prompt = hud.UnreadMessagesPrompt;
+                if (prompt != null && prompt.gameObject.activeSelf != active)
+                    prompt.gameObject.SetActive(active);
+            }
+            catch (Exception ex)
+            {
+                // Non-fatal
+                MelonLogger.Msg($"[NotificationBlocker] UnreadPrompt toggle error: {ex.Message}");
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Harmony patches
+    // -------------------------------------------------------------------------
+
+    // Intercept toast creation. If phone is dead, buffer and block.
+    [HarmonyPatch(typeof(NotificationsManager), nameof(NotificationsManager.SendNotification))]
+    internal static class Patch_NotificationsManager_SendNotification
+    {
+        static bool Prefix(string title, string subtitle, Sprite icon, float duration, bool playSound)
+        {
+            try
+            {
+                if (NotificationBlockerController.ShouldBlockNow())
+                {
+                    NotificationBlockerController.Buffer(title, subtitle, icon, duration, playSound);
+                    NotificationBlockerController.EnsureExists();
+                    return false; // skip original
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error("[NotificationBlocker] Prefix error: " + ex);
+            }
+            return true; // allow original
+        }
+    }
+
+    // Bootstrap safety: when PhoneBatteryComponent starts, ensure controller exists.
+    [HarmonyPatch(typeof(PhoneBatteryComponent), "Start")]
+    internal static class Patch_PhoneBatteryComponent_Start
+    {
+        static void Postfix() => NotificationBlockerController.EnsureExists();
+    }
+}
