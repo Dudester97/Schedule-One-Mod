@@ -1,0 +1,151 @@
+using UnityEngine;
+using MelonLoader;
+using ScheduleOne.PlayerScripts;
+using ScheduleOne.ItemFramework;
+using ScheduleOne.GameTime;
+using ScheduleOne.DevUtilities;
+using ScheduleOne.UI;
+using TMPro;
+using ScheduleOne.UI.Phone;
+using ScheduleOne.UI.Input;   // ✅ for InputPrompt
+
+namespace ScheduleOne.PhoneBattery
+{
+    public class PowerbankCharging : MonoBehaviour
+    {
+        public static bool IsCharging { get; private set; } = false;
+
+        private bool isChargingLocal = false;
+        private float holdTime = 0f;
+        private const float holdDuration = 0.66f; // ~1 second radial hold
+
+        // PowerbankCharging.cs (project 2.0)
+        // Full method: Update()
+        private void Update()
+        {
+            var inv = PlayerSingleton<PlayerInventory>.Instance;
+            if (inv == null)
+                return;
+
+            var powerbankDef = PowerBank.FindItemByName("Power Bank");
+            var slot = inv.equippedSlot;
+
+            bool hasPowerbankEquipped =
+                (slot != null && slot.ItemInstance != null && slot.ItemInstance.Definition == powerbankDef);
+
+            // ✅ Prevent using if battery full
+            if (PhoneBattery.CurrentBatteryLevel >= 100f && hasPowerbankEquipped)
+            {
+                if (Input.GetMouseButton(0)) // held down
+                {
+                    // Show warning continuously
+                    Singleton<HUD>.Instance.CrosshairText.Show(
+                        "Battery is full!",
+                        new Color(255f / 255f, 99f / 255f, 99f / 255f)
+                    );
+                }
+                else
+                {
+                    // Hide when LMB released
+                    Singleton<HUD>.Instance.CrosshairText.Hide();
+                }
+
+                // ⛔ Stop here: block radial & consumption logic
+                return;
+            }
+
+            // If holding LMB with Power Bank equipped and already charging (or console is charging)
+            if (Input.GetMouseButton(0) && hasPowerbankEquipped && (IsCharging || isChargingLocal || GameConsole.IsCharging))
+            {
+                Singleton<HUD>.Instance.CrosshairText.Show(
+                    "Phone is already charging!",
+                    new Color(255f / 255f, 99f / 255f, 99f / 255f)
+                );
+                return;
+            }
+
+            // Start hold-to-charge radial
+            if (Input.GetMouseButton(0) && !isChargingLocal && hasPowerbankEquipped)
+            {
+                holdTime += Time.deltaTime;
+
+                Singleton<HUD>.Instance.ShowRadialIndicator(holdTime / holdDuration);
+
+                if (holdTime >= holdDuration)
+                {
+                    TryUsePowerBank();
+                    holdTime = 0f;
+                    Singleton<HUD>.Instance.ShowRadialIndicator(0f);
+                }
+            }
+            else
+            {
+                if (holdTime > 0f)
+                {
+                    holdTime = 0f;
+                    Singleton<HUD>.Instance.ShowRadialIndicator(0f);
+                }
+
+                if (!Input.GetMouseButton(0))
+                    Singleton<HUD>.Instance.CrosshairText.Hide();
+            }
+        }
+
+
+        // PowerbankCharging.cs (project 2.0)
+        // Full method: TryUsePowerBank()
+        private void TryUsePowerBank()
+        {
+            var inv = PlayerSingleton<PlayerInventory>.Instance;
+            if (inv == null) return;
+
+            var powerbankDef = PowerBank.FindItemByName("Power Bank");
+            if (powerbankDef == null) return;
+
+            var slot = inv.equippedSlot;
+            if (slot == null || slot.ItemInstance == null || slot.ItemInstance.Definition != powerbankDef) return;
+
+            // ⛔ Don’t start if anything is already charging (prevents double-charging)
+            if (IsCharging || isChargingLocal || GameConsole.IsCharging) return;
+
+            // Consume one Power Bank
+            slot.ChangeQuantity(-1, false);
+
+            // (2.0 behavior) Refresh the equipped overlay
+            if (PhoneBatteryComponent.Instance != null)
+                PhoneBatteryComponent.Instance.HandleEquippedOverlay();
+
+            // (2.0 behavior) Auto-open the Phone screen
+            var gm = Singleton<GameplayMenu>.Instance;
+            if (gm != null)
+            {
+                gm.SetScreen(GameplayMenu.EGameplayScreen.Phone);
+                gm.SetIsOpen(true);
+            }
+
+            StartCoroutine(ChargeBatteryRoutine());
+        }
+
+
+        private System.Collections.IEnumerator ChargeBatteryRoutine()
+        {
+            isChargingLocal = true;
+            IsCharging = true;
+
+            while (PhoneBattery.CurrentBatteryLevel < 100f)
+            {
+                float timeMultiplier = NetworkSingleton<TimeManager>.Instance.TimeProgressionMultiplier;
+                if (timeMultiplier > 0)
+                {
+                    float chargePerSecond = (100f / 1f) / 60f;
+                    PhoneBattery.CurrentBatteryLevel += (Time.deltaTime * timeMultiplier) * chargePerSecond;
+                    PhoneBattery.CurrentBatteryLevel = Mathf.Clamp(PhoneBattery.CurrentBatteryLevel, 0f, 100f);
+                }
+                yield return null;
+            }
+
+            isChargingLocal = false;
+            IsCharging = false;
+        }
+    }
+}
