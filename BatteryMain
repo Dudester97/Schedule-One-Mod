@@ -1,0 +1,742 @@
+using UnityEngine;
+using UnityEngine.UI;
+using ScheduleOne.UI.Phone;
+using ScheduleOne.GameTime;
+using MelonLoader;
+using MelonLoader.Utils;
+using System.IO;
+using System;
+using System.Collections;
+using UnityEngine.SceneManagement;
+using HarmonyLib;
+using Newtonsoft.Json;
+using ScheduleOne.Persistence;
+using ScheduleOne.Persistence.Datas;
+using ScheduleOne.PlayerScripts;
+using System.Linq;
+using ScheduleOne.DevUtilities;
+using ScheduleOne.UI; // for HUD, InputPromptsCanvas (Singleton<InputPromptsCanvas>)
+using ScheduleOne.UI.MainMenu;
+using TMPro;
+using System.Reflection; // <-- for embedded resource loading
+
+
+[assembly: MelonInfo(typeof(ScheduleOne.PhoneBattery.PhoneBattery), "PhoneBattery", "1.0.0", "YourName")]
+[assembly: MelonGame("TVGS", "Schedule I")]
+
+namespace ScheduleOne.PhoneBattery
+{
+    public class PhoneBattery : MelonMod
+    {
+        public static PhoneBattery Instance { get; private set; }
+        public static float CurrentBatteryLevel = 100.0f;
+        private static string currentSaveName;
+
+        public static class Prefs
+        {
+            public static MelonPreferences_Category Category;
+            public static MelonPreferences_Entry<float> BatteryLifeInHours;
+        }
+
+        public class BatterySaveData
+        {
+            public string SaveName { get; set; }
+            public float BatteryLevel { get; set; }
+        }
+
+        public override void OnInitializeMelon()
+        {
+            Instance = this;
+            MelonLogger.Msg("PhoneBattery mod initialized.");
+
+            Prefs.Category = MelonPreferences.CreateCategory("PhoneBattery");
+            Prefs.BatteryLifeInHours = Prefs.Category.CreateEntry(
+                "BatteryLifeInHours",
+                1.0f,
+                "Battery Life (in-game hours)",
+                "The total amount of in-game hours the phone battery will last from 100% to 0%."
+            );
+        }
+
+        public override void OnApplicationStart()
+        {
+            MelonCoroutines.Start(SetupPhoneUI());
+        }
+
+        public override void OnApplicationQuit()
+        {
+            if (!string.IsNullOrEmpty(currentSaveName))
+                SaveBatteryData(currentSaveName);
+        }
+
+        public IEnumerator SetupPhoneUI()
+        {
+            MelonLogger.Msg("Waiting for PlayerSingleton<Phone> to be available...");
+            while (PlayerSingleton<Phone>.Instance == null)
+                yield return null;
+
+            GameObject phoneObject = PlayerSingleton<Phone>.Instance.gameObject;
+            if (phoneObject != null)
+            {
+                PhoneBatteryComponent batteryComponent = phoneObject.GetComponent<PhoneBatteryComponent>();
+                if (batteryComponent == null)
+                {
+                    batteryComponent = phoneObject.AddComponent<PhoneBatteryComponent>();
+                    MelonLogger.Msg("PhoneBatteryComponent attached to Phone GameObject.");
+                }
+            }
+            else
+            {
+                MelonLogger.Msg("Phone GameObject not found. Aborting PhoneBatteryComponent attachment.");
+            }
+            NotificationBlocker.Init();
+        }
+
+        public void SaveBatteryData(string saveName)
+        {
+            try
+            {
+                string modPath = Path.Combine(MelonEnvironment.GameRootDirectory, "Mods", "PhoneBattery", "Gamesave");
+                Directory.CreateDirectory(modPath);
+                string savePath = Path.Combine(modPath, $"{saveName}.json");
+
+                BatterySaveData data = new BatterySaveData
+                {
+                    SaveName = saveName,
+                    BatteryLevel = CurrentBatteryLevel
+                };
+
+                // CHANGED: pretty-print so there are line breaks/indentation
+                string json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                File.WriteAllText(savePath, json);
+
+                MelonLogger.Msg("Battery data saved successfully.");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Msg($"Error saving battery data: {e.Message}");
+            }
+        }
+
+
+        public void LoadBatteryData(string saveName)
+        {
+            currentSaveName = saveName;
+            try
+            {
+                string modPath = Path.Combine(MelonEnvironment.GameRootDirectory, "Mods", "PhoneBattery", "Gamesave");
+                string savePath = Path.Combine(modPath, $"{saveName}.json");
+
+                if (File.Exists(savePath))
+                {
+                    string json = File.ReadAllText(savePath);
+                    BatterySaveData data = JsonConvert.DeserializeObject<BatterySaveData>(json);
+                    CurrentBatteryLevel = data.BatteryLevel;
+                    MelonLogger.Msg($"Battery level loaded for save {saveName}: {CurrentBatteryLevel}%");
+                }
+                else
+                {
+                    MelonLogger.Msg("No existing battery data found. Starting at 100%.");
+                    CurrentBatteryLevel = 100.0f;
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Msg($"Error loading battery data: {e.Message}");
+                CurrentBatteryLevel = 100.0f;
+            }
+        }
+
+        public void ResetModState()
+        {
+            currentSaveName = string.Empty;
+            CurrentBatteryLevel = 100.0f;
+            MelonLogger.Msg("Mod state reset for new game session.");
+        }
+    }
+
+    public class PhoneBatteryComponent : MonoBehaviour
+    {
+        // Add a static instance property to the component so it can be accessed by patches.
+        public static PhoneBatteryComponent Instance { get; private set; }
+
+        public Texture2D[] batteryIcons = new Texture2D[4];
+        private Texture2D batteryDeadIcon;        // 👈 add this
+        private Texture2D[] chargeCycleIcons;     // 👈 add this
+
+        private float chargeAnimTimer = 0f;       // 👈 add this
+        private int chargeAnimIndex = 0;          // 👈 add this
+
+        private RawImage batteryIconUI;
+        private TextMeshProUGUI batteryTextUI;
+
+        // References for dead screen handling
+        private Transform appIcons;
+        private GameObject backgroundImage;
+        private RawImage deadScreenUI;         // 👈 RawImage to hold deadscreen.png
+        private Texture2D deadScreenTexture;   // 👈 add this for deadscreen.png
+
+       
+
+
+
+
+        // Expose overlay so other classes (e.g., PowerbankCharging) can toggle it
+        public RawImage EquippedOverlayUI { get; private set; }
+        //when equipping the powerbank
+        private Texture2D powerbankEquippedTex;
+
+        private bool isUIActive = true;
+
+        private void Awake()
+        {
+            // Set the static instance when the component first wakes up.
+            Instance = this;
+        }
+
+        private void OnDestroy()
+        {
+            if (Instance == this)
+            {
+                Instance = null;
+            }
+        }
+
+        private void InitializeUI(Transform infoBarTransform)
+        {
+            LoadTextures();
+
+            if (batteryIcons.Length < 4 || batteryIcons.Any(icon => icon == null))
+            {
+                MelonLogger.Msg("Failed to load battery icons. Aborting UI creation.");
+                this.enabled = false;
+                return;
+            }
+
+            RemoveTextFromInfoBar(infoBarTransform);
+
+            GameObject batteryIconObject = new GameObject("BatteryIcon");
+            batteryIconObject.transform.SetParent(infoBarTransform, false);
+            batteryIconUI = batteryIconObject.AddComponent<RawImage>();
+
+            Button batteryButton = batteryIconObject.AddComponent<Button>();
+            batteryButton.onClick.AddListener(OnBatteryIconClick);
+            batteryButton.targetGraphic = batteryIconUI;
+
+            RectTransform rectTransform = batteryIconObject.GetComponent<RectTransform>();
+            rectTransform.anchorMin = new Vector2(1, 0.5f);
+            rectTransform.anchorMax = new Vector2(1, 0.5f);
+            rectTransform.pivot = new Vector2(1, 0.5f);
+            rectTransform.anchoredPosition = new Vector2(-10, 0);
+            rectTransform.sizeDelta = new Vector2(56, 30);
+            MelonLogger.Msg("Battery icon UI created and attached to the InfoBar.");
+
+            TMP_FontAsset fontAsset = Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault(f => f.name == "OpenSans-SemiBold SDF" || f.name == "OpenSans-SemiBold");
+
+            if (fontAsset == null)
+            {
+                MelonLogger.Msg("Could not find the 'OpenSans-SemiBold' font asset. Aborting text creation.");
+                return;
+            }
+
+            GameObject batteryTextObject = new GameObject("BatteryPercentageText");
+            batteryTextObject.transform.SetParent(infoBarTransform, false);
+
+            batteryTextUI = batteryTextObject.AddComponent<TextMeshProUGUI>();
+            batteryTextUI.font = fontAsset;
+            batteryTextUI.fontSize = 28;
+            batteryTextUI.color = Color.white;
+            batteryTextUI.alignment = TextAlignmentOptions.Right;
+
+            RectTransform textRectTransform = batteryTextObject.GetComponent<RectTransform>();
+            textRectTransform.anchorMin = new Vector2(1, 0.5f);
+            textRectTransform.anchorMax = new Vector2(1, 0.5f);
+            textRectTransform.pivot = new Vector2(1, 0.5f);
+            textRectTransform.anchoredPosition = new Vector2(-10 - 56 - 5, 0);
+            textRectTransform.sizeDelta = new Vector2(80, 40);
+
+            MelonLogger.Msg("Battery percentage text UI created successfully.");
+        }
+
+        private void OnBatteryIconClick()
+        {
+            // App removed: keep click lightweight (example behavior)
+            MelonLogger.Msg("Battery icon clicked (no BatterySettings app attached).");
+            // Optional: toggle the percentage text visibility
+            if (batteryTextUI != null)
+                batteryTextUI.gameObject.SetActive(!batteryTextUI.gameObject.activeSelf);
+        }
+
+        private void Start()
+        {
+            MelonLogger.Msg("PhoneBatteryComponent.Start() called.");
+            if (batteryIconUI == null)
+            {
+                Transform infoBarTransform = PlayerSingleton<Phone>.Instance.transform.Find("phone/HomeScreen/InfoBar");
+                if (infoBarTransform != null)
+                {
+                    InitializeUI(infoBarTransform);
+                }
+            }
+
+            // Get phone hierarchy references
+            Transform homeScreen = PlayerSingleton<Phone>.Instance.transform.Find("phone/HomeScreen");
+            if (homeScreen != null)
+            {
+                appIcons = homeScreen.Find("AppIcons");
+                backgroundImage = homeScreen.Find("Background/Image")?.gameObject;
+
+                // Create dead screen image directly under HomeScreen (covering everything)
+                Transform bg = homeScreen.Find("Background");
+                if (bg != null)
+                {
+                    GameObject deadScreenObj = new GameObject("DeadScreenImage");
+                    deadScreenObj.transform.SetParent(homeScreen, false);
+                    deadScreenObj.transform.SetAsLastSibling(); // ensures it covers icons & wallpaper
+                    deadScreenUI = deadScreenObj.AddComponent<RawImage>();
+                    if (deadScreenTexture != null)
+                    {
+                        deadScreenUI.texture = deadScreenTexture;
+                        deadScreenUI.color = Color.white;
+                    }
+
+                    RectTransform rect = deadScreenObj.GetComponent<RectTransform>();
+                    rect.anchorMin = Vector2.zero;
+                    rect.anchorMax = Vector2.one;
+                    rect.offsetMin = Vector2.zero;
+                    rect.offsetMax = Vector2.zero;
+
+                    deadScreenUI.gameObject.SetActive(false);
+                    MelonLogger.Msg("DeadScreen image injected.");
+                }
+            }
+
+            // 🔹 Load PowerbankEquipped.png (embedded)
+            LoadEquippedTextures();
+
+            // Create overlay GameObject
+            GameObject overlayObj = new GameObject("EquippedOverlay");
+
+            // ✅ Parent overlay to the OnlineSlot under CashSlotContainer (your confirmed path)
+            Transform hudParent = GameObject.Find("UI")?.transform
+                ?.Find("HUD/HotbarContainer/Slots/CashSlotContainer/OnlineSlot");
+            if (hudParent != null)
+            {
+                overlayObj.transform.SetParent(hudParent, false);
+                overlayObj.transform.SetAsLastSibling(); // draw on top of slot contents
+            }
+            else
+            {
+                MelonLogger.Warning("[PhoneBattery] Could not find UI/HUD/HotbarContainer/Slots/CashSlotContainer/OnlineSlot. Overlay attached to root instead!");
+            }
+
+            // Setup UI component
+            EquippedOverlayUI = overlayObj.AddComponent<RawImage>();
+            RectTransform overlayRect = EquippedOverlayUI.rectTransform;
+
+            // 🔸 Use the OLD DELTA with your requested anchored position
+            overlayRect.anchorMin = new Vector2(0.5f, 0.5f);
+            overlayRect.anchorMax = new Vector2(0.5f, 0.5f);
+            overlayRect.pivot = new Vector2(0.5f, 0.5f);
+            overlayRect.anchoredPosition = new Vector2(0f, 160.8878f); // your position
+            overlayRect.sizeDelta = new Vector2(155, 240);             // old delta retained
+
+            // Assign texture if available
+            if (powerbankEquippedTex != null)
+                EquippedOverlayUI.texture = powerbankEquippedTex;
+
+            EquippedOverlayUI.gameObject.SetActive(false);
+
+            if (PlayerSingleton<Phone>.Instance != null)
+            {
+                GameObject phoneObject = PlayerSingleton<Phone>.Instance.gameObject;
+                if (phoneObject.GetComponent<PowerbankCharging>() == null)
+                {
+                    phoneObject.AddComponent<PowerbankCharging>();
+                    MelonLogger.Msg("PowerbankCharging attached to Phone GameObject.");
+                }
+            }
+
+            UpdateBatteryIcon();
+            UpdateBatteryText();
+
+        }
+
+        private IEnumerator SlideInOverlay(RectTransform rect, Vector2 target, float duration)
+        {
+            Vector2 start = new Vector2(target.x, -200f); // off-screen start
+            float elapsed = 0f;
+
+            // Start from off-screen
+            rect.anchoredPosition = start;
+
+            while (elapsed < duration)
+            {
+                rect.anchoredPosition = Vector2.Lerp(start, target, elapsed / duration);
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+
+            // Snap to final position
+            rect.anchoredPosition = target;
+        }
+
+
+
+
+        // [UPDATED] Pause drain when either PowerbankCharging OR TVcharge is charging.
+        // Also animate the charging icon in the same combined condition.
+        private void LateUpdate()
+        {
+            if (!isUIActive)
+                return;
+
+            UpdateBatteryIcon();
+            UpdateBatteryText();
+            HandleDeadScreen();
+            HandleEquippedOverlay();
+
+
+            // Stop any battery processing at end of day
+            if (NetworkSingleton<TimeManager>.Instance.IsEndOfDay)
+                return;
+
+            // [ADDED] Also pause drain when the console charger is active
+            if (PowerbankCharging.IsCharging || GameConsole.IsCharging)
+                return;
+
+            float timeMultiplier = NetworkSingleton<TimeManager>.Instance.TimeProgressionMultiplier;
+            if (timeMultiplier > 0)
+            {
+                if (PhoneBattery.Prefs.BatteryLifeInHours.Value <= 0)
+                {
+                    PhoneBattery.CurrentBatteryLevel = 0.0f;
+                    HandleDeadScreen();
+                    return;
+                }
+
+                float drainPerSecond = (100.0f / PhoneBattery.Prefs.BatteryLifeInHours.Value) / 60.0f;
+                PhoneBattery.CurrentBatteryLevel -= (Time.deltaTime * timeMultiplier) * drainPerSecond;
+                PhoneBattery.CurrentBatteryLevel = Mathf.Clamp(PhoneBattery.CurrentBatteryLevel, 0.0f, 100.0f);
+            }
+        }
+
+
+        // Closes the currently open phone app ONLY if the phone UI is already open and on the Phone screen.
+        private void CloseActiveAppIfPhoneOpen()
+        {
+            var gm = Singleton<GameplayMenu>.Instance;
+            if (gm == null) return;
+
+            // Only act if the gameplay menu is open AND the current screen is the Phone
+            if (!gm.IsOpen || gm.CurrentScreen != GameplayMenu.EGameplayScreen.Phone)
+                return;
+
+            var phone = PlayerSingleton<Phone>.Instance;
+            if (phone == null) return;
+
+            // Only request close if an app is actually active; the game will no-op otherwise
+            if (ScheduleOne.UI.Phone.Phone.ActiveApp != null)
+            {
+                phone.RequestCloseApp(); // calls internal closeApps delegate if ActiveApp != null
+                MelonLogger.Msg("[PhoneBattery] Closed active phone app due to 0% battery.");
+            }
+        }
+
+
+        private void HandleDeadScreen()
+        {
+            if (PhoneBattery.CurrentBatteryLevel < 1f)
+            {
+                if (appIcons != null) appIcons.gameObject.SetActive(false);
+                if (backgroundImage != null) backgroundImage.SetActive(false);
+
+                // Also hide InfoBar when dead
+                Transform infoBar = PlayerSingleton<Phone>.Instance.transform.Find("phone/HomeScreen/InfoBar");
+                if (infoBar != null) infoBar.gameObject.SetActive(false);
+
+                if (deadScreenUI != null) deadScreenUI.gameObject.SetActive(true);
+                CloseActiveAppIfPhoneOpen();
+            }
+            else
+            {
+                if (appIcons != null) appIcons.gameObject.SetActive(true);
+                if (backgroundImage != null) backgroundImage.SetActive(true);
+
+                Transform infoBar = PlayerSingleton<Phone>.Instance.transform.Find("phone/HomeScreen/InfoBar");
+                if (infoBar != null) infoBar.gameObject.SetActive(true);
+
+                if (deadScreenUI != null) deadScreenUI.gameObject.SetActive(false);
+            }
+        }
+
+        private void LoadEquippedTextures()
+        {
+            try
+            {
+                // Embedded-only: ignore disk, load by filename
+                powerbankEquippedTex = LoadEmbeddedTextureByFileName("PowerbankEquipped.png");
+
+                if (powerbankEquippedTex != null)
+                {
+                    MelonLogger.Msg("[PhoneBattery] PowerbankEquipped.png loaded (embedded).");
+                }
+                else
+                {
+                    MelonLogger.Warning("[PhoneBattery] Failed to load embedded PowerbankEquipped.png");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                MelonLogger.Error("[PhoneBattery] Exception while loading PowerbankEquipped.png: " + ex.Message);
+            }
+        }
+
+        public void HandleEquippedOverlay()
+        {
+            var inv = PlayerSingleton<PlayerInventory>.Instance;
+
+            if (inv == null || inv.equippedSlot == null || inv.equippedSlot.ItemInstance == null)
+            {
+                if (EquippedOverlayUI != null)
+                    EquippedOverlayUI.gameObject.SetActive(false);
+                return;
+            }
+
+            bool hasPowerbankEquipped =
+                inv.equippedSlot.ItemInstance.Definition == PowerBank.FindItemByName("Power Bank");
+
+            if (EquippedOverlayUI == null)
+                return;
+
+            if (hasPowerbankEquipped)
+            {
+                // Detect first frame of "becoming equipped" so we only animate once
+                bool wasActive = EquippedOverlayUI.gameObject.activeSelf;
+
+                EquippedOverlayUI.texture = powerbankEquippedTex;
+                EquippedOverlayUI.gameObject.SetActive(true);
+
+                if (!wasActive)
+                {
+                    // Slide from off-screen Y = -200 to your target Y = 160.8878 over 0.5s
+                    StartCoroutine(SlideInOverlay(
+                        EquippedOverlayUI.rectTransform,
+                        new Vector2(0f, 160.8878f),
+                        0.1f
+                    ));
+                }
+            }
+            else
+            {
+                EquippedOverlayUI.gameObject.SetActive(false);
+            }
+        }
+
+
+
+
+
+
+
+
+
+
+        // [UPDATED] Show charging animation when either Powerbank or TV console is charging.
+        private void UpdateBatteryIcon()
+        {
+            if (batteryIconUI == null) return;
+
+            // [ADDED] Combined charging condition
+            if (PowerbankCharging.IsCharging || GameConsole.IsCharging)
+            {
+                // Animate charging cycle
+                chargeAnimTimer += Time.deltaTime;
+                if (chargeAnimTimer >= 0.5f) // half-second per frame
+                {
+                    chargeAnimTimer = 0f;
+                    chargeAnimIndex = (chargeAnimIndex + 1) % chargeCycleIcons.Length;
+                }
+                batteryIconUI.texture = chargeCycleIcons[chargeAnimIndex];
+            }
+            else
+            {
+                // Normal icons
+                Texture2D iconToUse;
+                if (PhoneBattery.CurrentBatteryLevel <= 0)
+                {
+                    iconToUse = batteryDeadIcon; // new texture
+                }
+                else if (PhoneBattery.CurrentBatteryLevel <= 25)
+                {
+                    iconToUse = batteryIcons[0]; // battery25.png
+                }
+                else if (PhoneBattery.CurrentBatteryLevel <= 50)
+                {
+                    iconToUse = batteryIcons[1]; // battery50.png
+                }
+                else if (PhoneBattery.CurrentBatteryLevel <= 75)
+                {
+                    iconToUse = batteryIcons[2]; // battery75.png
+                }
+                else
+                {
+                    iconToUse = batteryIcons[3]; // battery100.png
+                }
+
+                batteryIconUI.texture = iconToUse;
+                chargeAnimTimer = 0f;
+                chargeAnimIndex = 0;
+            }
+        }
+
+
+        private void UpdateBatteryText()
+        {
+            if (batteryTextUI != null)
+                batteryTextUI.text = $"{(int)PhoneBattery.CurrentBatteryLevel}%";
+        }
+
+        private void LoadTextures()
+        {
+            try
+            {
+                batteryDeadIcon = LoadEmbeddedTextureByFileName("batterydead.png");
+                deadScreenTexture = LoadEmbeddedTextureByFileName("deadscreen.png");
+                batteryIcons[0] = LoadEmbeddedTextureByFileName("battery25.png");
+                batteryIcons[1] = LoadEmbeddedTextureByFileName("battery50.png");
+                batteryIcons[2] = LoadEmbeddedTextureByFileName("battery75.png");
+                batteryIcons[3] = LoadEmbeddedTextureByFileName("battery100.png");
+
+                chargeCycleIcons = new Texture2D[]
+                {
+                    LoadEmbeddedTextureByFileName("battery25charging.png"),
+                    batteryIcons[1],
+                    batteryIcons[2],
+                    batteryIcons[3]
+                };
+
+                MelonLogger.Msg("Finished loading embedded battery icons.");
+            }
+            catch (System.Exception e)
+            {
+                MelonLogger.Msg("Failed to load embedded battery icons: " + e.Message);
+            }
+        }
+
+        // ---- Embedded-only helpers ----
+
+        private Texture2D LoadEmbeddedTextureByFileName(string fileName)
+        {
+            try
+            {
+                var asm = Assembly.GetExecutingAssembly();
+                string match = null;
+                var names = asm.GetManifestResourceNames();
+                for (int i = 0; i < names.Length; i++)
+                {
+                    var n = names[i];
+                    if (n.EndsWith(fileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = n;
+                        break;
+                    }
+                }
+                if (string.IsNullOrEmpty(match))
+                {
+                    MelonLogger.Msg($"[PhoneBattery] Embedded resource not found: {fileName}");
+                    return null;
+                }
+
+                using (var s = asm.GetManifestResourceStream(match))
+                {
+                    if (s == null) return null;
+                    using (var ms = new MemoryStream())
+                    {
+                        s.CopyTo(ms);
+                        byte[] bytes = ms.ToArray();
+                        var tex = new Texture2D(2, 2);
+                        if (ImageConversion.LoadImage(tex, bytes))
+                            return tex;
+
+                        MelonLogger.Msg($"[PhoneBattery] Failed to decode embedded PNG: {fileName}");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Msg($"[PhoneBattery] Embedded texture load failed for '{fileName}': {e.Message}");
+            }
+            return null;
+        }
+
+        // Kept for API stability with old callers, but now embedded-only.
+        private Texture2D LoadTexture(string path)
+        {
+            string fileName = Path.GetFileName(path);
+            return LoadEmbeddedTextureByFileName(fileName);
+        }
+
+        private void RemoveTextFromInfoBar(Transform infoBar)
+        {
+            if (infoBar != null)
+            {
+                Transform dataTextTransform = infoBar.Find("Data");
+                if (dataTextTransform != null)
+                {
+                    dataTextTransform.gameObject.SetActive(false);
+                    MelonLogger.Msg("Successfully removed 'Data' text from InfoBar.");
+                }
+                else
+                {
+                    MelonLogger.Msg("'Data' text GameObject not found in InfoBar.");
+                }
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(ScheduleOne.Persistence.LoadManager), "StartGame",
+              new Type[] { typeof(SaveInfo), typeof(bool), typeof(bool) })]
+    public static class BatteryLoadPatch
+    {
+        private static void Postfix(ScheduleOne.Persistence.SaveInfo info)
+        {
+            // Load battery state from save
+            if (info != null && !string.IsNullOrEmpty(info.OrganisationName))
+            {
+                PhoneBattery.Instance.LoadBatteryData(info.OrganisationName);
+            }
+
+            // Attach UI
+            MelonCoroutines.Start(PhoneBattery.Instance.SetupPhoneUI());
+
+            // Re-inject PowerBank each time a save loads
+            PowerBank.ForceReinitialize();
+        }
+    }
+
+    [HarmonyPatch(typeof(ScheduleOne.Persistence.SaveManager), "Save", new Type[0])]
+    public static class BatterySavePatch
+    {
+        private static void Postfix()
+        {
+            if (Singleton<LoadManager>.Instance != null && Singleton<LoadManager>.Instance.ActiveSaveInfo != null && !string.IsNullOrEmpty(Singleton<LoadManager>.Instance.ActiveSaveInfo.OrganisationName))
+            {
+                PhoneBattery.Instance.SaveBatteryData(Singleton<LoadManager>.Instance.ActiveSaveInfo.OrganisationName);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(ScheduleOne.Persistence.LoadManager), "ExitToMenu", new Type[] { typeof(SaveInfo), typeof(MainMenuPopup.Data), typeof(bool) })]
+    public static class BatteryResetPatch
+    {
+        private static void Postfix()
+        {
+            if (PhoneBattery.Instance != null)
+            {
+                PhoneBattery.Instance.ResetModState();
+            }
+        }
+    }
+    
+}
