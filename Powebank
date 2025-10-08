@@ -1,0 +1,328 @@
+using System;
+using System.IO;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection; // <-- for embedded resource loading
+using HarmonyLib;
+
+using MelonLoader;
+using MelonLoader.Utils;
+using UnityEngine;
+
+// Game namespaces
+using ScheduleOne.PlayerScripts;
+using ScheduleOne.UI.Shop;
+using ScheduleOne.ItemFramework;
+using ScheduleOne.Persistence; // LoadManager, SaveInfo
+using ScheduleOne.DevUtilities;   // For Singleton<T>
+using ScheduleOne.Storage;
+
+namespace ScheduleOne.PhoneBattery
+{
+    public static class PowerBank
+    {
+        private const string ItemId = "powerbank";
+        private const string ItemName = "Power Bank";
+        private const float DefaultPrice = 20f;
+        private const string KnownShopItemName = "Bed";
+
+        private const bool GiveOneToPlayerForTest = true;
+        private const bool InjectIntoAllShops = true;
+
+        private static bool _initialized;
+        private static bool _initRunning;
+        private static Sprite _icon;
+
+        private static readonly HashSet<string> AllowedShopCodes =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "handy_hanks",
+            "gas_mart_west",
+            "dans_hardware",
+            "gas_mart_central",
+            "dark_market_shop" // Oscar's Store
+        };
+
+        // -----------------------------------------------------------------
+        // Public API
+        // -----------------------------------------------------------------
+        public static void Initialize()
+        {
+            if (_initialized || _initRunning) return;
+            _initRunning = true;
+            MelonCoroutines.Start(InitRoutine());
+        }
+
+        public static void ForceReinitialize()
+        {
+            _initialized = false;
+            Initialize();
+        }
+
+        // -----------------------------------------------------------------
+        // Init coroutine
+        // -----------------------------------------------------------------
+        private static IEnumerator InitRoutine()
+        {
+            while (Singleton<Registry>.Instance == null)
+                yield return null;
+
+            if (GiveOneToPlayerForTest)
+                while (PlayerSingleton<PlayerInventory>.Instance == null)
+                    yield return null;
+
+            // Embedded-only: the path is ignored inside the loader (uses filename)
+            _icon = LoadSpriteFromFile(
+                Path.Combine(MelonEnvironment.GameRootDirectory, "Mods", "PhoneBattery", "Sprites", "Powerbank", "PowerbankIcon.png")
+            );
+
+            var def = CreateAndRegisterDefinition(_icon);
+            if (def == null)
+            {
+                _initRunning = false;
+                yield break;
+            }
+
+            if (GiveOneToPlayerForTest && !_initialized)
+            {
+                yield return null;
+                yield return null;
+                TryGiveToPlayer(def, 1);
+            }
+
+            if (InjectIntoAllShops && !_initialized)
+                MelonCoroutines.Start(InjectIntoShopsRoutine(def));
+
+            MelonLogger.Msg("[PowerBank] Initialize complete.");
+            _initialized = true;
+            _initRunning = false;
+        }
+
+        // -----------------------------------------------------------------
+        // Definition + Registry
+        // -----------------------------------------------------------------
+        private static StorableItemDefinition CreateAndRegisterDefinition(Sprite icon)
+        {
+            try
+            {
+                var def = ScriptableObject.CreateInstance<StorableItemDefinition>();
+                def.ID = ItemId;
+                def.Name = ItemName;
+                def.Icon = icon;
+                def.BasePurchasePrice = DefaultPrice;
+                def.RequiresLevelToPurchase = false;
+                def.RequiredRank = default;
+                def.Equippable = null; // no prefab
+                def.StackLimit = 20;
+                def.Description = "A portable charger for your phone.";
+
+                // NEW: reuse the game's generic 2x2 cardboard box stored-item template
+                def.StoredItem = FindGenericBoxTemplate1x1();
+                if (def.StoredItem == null)
+                {
+                    MelonLogger.Msg("[PowerBank] WARNING: No 1x1 StoredItem_GenericBox found; shelf placement will be disabled.");
+                }
+
+                if (def.ShopCategories == null)
+                    def.ShopCategories = new List<ShopListing.CategoryInstance>();
+                def.ShopCategories.Clear();
+
+                var templateShopItem = FindItemByName(KnownShopItemName);
+                if (templateShopItem != null && templateShopItem.ShopCategories != null && templateShopItem.ShopCategories.Count > 0)
+                {
+                    def.ShopCategories.AddRange(templateShopItem.ShopCategories);
+                    MelonLogger.Msg($"[PowerBank] Copied shop categories from '{KnownShopItemName}'.");
+                }
+                else
+                {
+                    MelonLogger.Msg($"[PowerBank] Could not copy categories from '{KnownShopItemName}'.");
+                }
+
+                Singleton<Registry>.Instance.AddToRegistry(def);
+                MelonLogger.Msg($"[PowerBank] Registered Power Bank definition (price {def.BasePurchasePrice}).");
+
+                return def;
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Error("[PowerBank] CreateAndRegisterDefinition error: " + e);
+                return null;
+            }
+        }
+
+        // Find a generic 2x2 box template the game already uses, so we can reuse it.
+        // We prefer an asset/prefab, but will fall back to any loaded instance.
+        private static StoredItem FindGenericBoxTemplate1x1()
+        {
+            try
+            {
+                var all = Resources.FindObjectsOfTypeAll<StoredItem_GenericBox>();
+                StoredItem_GenericBox best = null;
+
+                foreach (var s in all)
+                {
+                    if (s == null) continue;
+
+                    // First choice: a 2x2 variant
+                    if (s.xSize == 1 && s.ySize == 1)
+                    {
+                        // Prefer one whose name hints it's a generic box prefab
+                        if (best == null) best = s;
+                        if (s.name != null && s.name.IndexOf("1x1", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return s;
+                    }
+                }
+
+                if (best != null) return best;
+
+                MelonLogger.Msg("[PowerBank] Could not find a 1x1 StoredItem_GenericBox template.");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Msg("[PowerBank] Failed to search for StoredItem_GenericBox: " + ex.Message);
+            }
+            return null;
+        }
+
+
+        public static StorableItemDefinition FindItemByName(string displayName)
+        {
+            var reg = Singleton<Registry>.Instance;
+            if (reg == null) return null;
+
+            var all = reg.GetAllItems();
+            if (all == null) return null;
+
+            foreach (var it in all)
+                if (it is StorableItemDefinition s &&
+                    string.Equals(s.Name, displayName, StringComparison.OrdinalIgnoreCase))
+                    return s;
+            return null;
+        }
+
+        private static void TryGiveToPlayer(StorableItemDefinition def, int count)
+        {
+            try
+            {
+                var inv = PlayerSingleton<PlayerInventory>.Instance;
+                if (inv == null) return;
+
+                var inst = def.GetDefaultInstance(count);
+                inv.AddItemToInventory(inst);
+                MelonLogger.Msg($"[PowerBank] Gave {count}x '{def.Name}' to player.");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Msg("[PowerBank] Could not give item to player: " + e.Message);
+            }
+        }
+
+        private static IEnumerator InjectIntoShopsRoutine(StorableItemDefinition def)
+        {
+            while (UnityEngine.Object.FindObjectsOfType<ShopInterface>(true).Length == 0)
+                yield return null;
+
+            yield return new WaitForSeconds(0.25f);
+
+            var shops = UnityEngine.Object.FindObjectsOfType<ShopInterface>(true);
+            int injected = 0, uiBuilt = 0;
+
+            MethodInfo miCreateListingUI =
+                typeof(ShopInterface).GetMethod("CreateListingUI", BindingFlags.Instance | BindingFlags.NonPublic);
+            MethodInfo miRefreshShownItems =
+                typeof(ShopInterface).GetMethod("RefreshShownItems", BindingFlags.Instance | BindingFlags.NonPublic);
+
+            foreach (var shop in shops)
+            {
+                if (shop == null) continue;
+
+                if (!AllowedShopCodes.Contains(shop.ShopCode))
+                {
+                    MelonLogger.Msg($"[PowerBank] Skipping ShopName='{shop.ShopName}', ShopCode='{shop.ShopCode}'");
+                    continue;
+                }
+
+                if (shop.Listings != null && shop.Listings.Exists(l => l != null && l.Item == def))
+                    continue;
+
+                var listing = new ShopListing { Item = def, LimitedStock = false };
+                if (shop.Listings == null)
+                    shop.Listings = new List<ShopListing>();
+                shop.Listings.Add(listing);
+                injected++;
+
+                try
+                {
+                    miCreateListingUI?.Invoke(shop, new object[] { listing });
+                    uiBuilt++;
+                    miRefreshShownItems?.Invoke(shop, null);
+                }
+                catch (Exception ex)
+                {
+                    MelonLogger.Msg($"[PowerBank] UI build failed for shop '{shop.ShopName}': {ex.Message}");
+                }
+
+                MelonLogger.Msg($"[PowerBank] Injected into ShopName='{shop.ShopName}', ShopCode='{shop.ShopCode}'");
+            }
+
+            MelonLogger.Msg($"[PowerBank] Injected Power Bank into {injected} shop(s); built UI in {uiBuilt} shop(s).");
+        }
+
+        // ------- Embedded-only sprite loader (keeps old API signature) -------
+        private static Sprite LoadSpriteFromFile(string path)
+        {
+            try
+            {
+                string fileName = Path.GetFileName(path);
+                var asm = Assembly.GetExecutingAssembly();
+                string match = null;
+                var names = asm.GetManifestResourceNames();
+                for (int i = 0; i < names.Length; i++)
+                {
+                    var n = names[i];
+                    if (n.EndsWith(fileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = n;
+                        break;
+                    }
+                }
+                if (string.IsNullOrEmpty(match))
+                {
+                    MelonLogger.Msg($"[PowerBank] Embedded icon not found: {fileName}");
+                    return null;
+                }
+
+                using (var s = asm.GetManifestResourceStream(match))
+                {
+                    if (s == null) return null;
+                    using (var ms = new MemoryStream())
+                    {
+                        s.CopyTo(ms);
+                        byte[] data = ms.ToArray();
+                        Texture2D tex = new Texture2D(2, 2);
+                        if (ImageConversion.LoadImage(tex, data))
+                            return Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height), new Vector2(0.5f, 0.5f), 100f);
+
+                        MelonLogger.Msg("[PowerBank] Failed to create sprite from embedded texture data.");
+                        return null;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Error("[PowerBank] Embedded sprite load error: " + e);
+                return null;
+            }
+        }
+    }
+
+    // Re-inject on save load
+    [HarmonyPatch(typeof(LoadManager), "StartGame", new Type[] { typeof(SaveInfo), typeof(bool), typeof(bool) })]
+    public static class PowerBankLoadPatch
+    {
+        private static void Postfix()
+        {
+            PowerBank.ForceReinitialize();
+        }
+    }
+}
