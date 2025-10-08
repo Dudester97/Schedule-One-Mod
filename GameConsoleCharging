@@ -1,0 +1,760 @@
+/********* GameConsoleCharging.cs **********************************************
+ * [Schedule I (TVGS)] additive runtime injection for a toggleable console charger
+ * - Leaves original 'TV_Built/TV cabinet/retro_console_main' DISABLED
+ * - Clones under 'TV_Built' with position/rotation/scale you specified
+ * - Adds InteractableObject + InteractableToggleable (default keypress, range=2f)
+ * - GUID-based ownership lock so only the owning placed TV can start/stop charging
+ * - Hover label shows battery % (red for "Charge phone", green for "Stop charging")
+ * - Non-owner consoles show a yellow "Already charging!" + green % and are vetoed
+ *******************************************************************************/
+
+using System;
+using System.Collections;
+using System.Reflection;
+using HarmonyLib;
+using MelonLoader;
+using UnityEngine;
+using ScheduleOne.Interaction;
+using ScheduleOne.Persistence;
+using ScheduleOne.GameTime;
+using ScheduleOne.DevUtilities;
+
+namespace ScheduleOne.PhoneBattery
+{
+    // ----------------------------------------------------------------------------
+    // Clone & setup under TV_Built
+    // ----------------------------------------------------------------------------
+    [HarmonyPatch(typeof(LoadManager), "StartGame",
+        new Type[] { typeof(SaveInfo), typeof(bool), typeof(bool) })]
+    internal static class GameConsoleCharging_StartPatch
+    {
+        private const string SrcPath = "TV_Built/TV cabinet/retro_console_main";
+        private const string DstPath = "TV_Built";              // parent is TV_Built
+        private const string NewName = "GameConsoleCharging";
+        private const string NearbyIntObjPath = "TV_Built/IntObj";
+        private static void Postfix() => MelonCoroutines.Start(SetupRoutine());
+
+        // FULL METHOD: SetupRoutine() — clone console, add interactables, phone prop, and charging light
+        private static IEnumerator SetupRoutine()
+        {
+            float deadline = Time.realtimeSinceStartup + 5f;
+            Transform src = null, dstParent = null;
+
+            // Find inactive/nested objects too (without enabling anything)
+            while (Time.realtimeSinceStartup < deadline && (src == null || dstParent == null))
+            {
+                src = src ?? FindByPathLoose(SrcPath);
+                dstParent = dstParent ?? FindByPathLoose(DstPath);
+                if (src != null && dstParent != null) break;
+                yield return null;
+            }
+
+            if (src == null) yield break;
+            if (dstParent == null) yield break;
+
+            // --- Enforce original source disabled to avoid duplicate visible consoles ---
+            if (src.gameObject.activeSelf)
+                src.gameObject.SetActive(false);
+
+            // --- Ensure both joysticks are enabled (so the TV area looks correct) ---
+            var joy1 = FindByPathLoose("TV_Built/TV cabinet/retro_console_joystick");
+            if (joy1 != null && !joy1.gameObject.activeSelf)
+                joy1.gameObject.SetActive(true);
+
+            var joy2 = FindByPathLoose("TV_Built/TV cabinet/retro_console_joystick (1)");
+            if (joy2 != null && !joy2.gameObject.activeSelf)
+                joy2.gameObject.SetActive(true);
+
+            // Don’t duplicate our injected console
+            if (dstParent.Find(NewName) != null)
+                yield break;
+
+            // Clone while leaving the original disabled
+            GameObject clone = UnityEngine.Object.Instantiate(src.gameObject);
+            clone.name = NewName;
+            clone.transform.SetParent(dstParent, false);
+            clone.transform.localPosition = new Vector3(0.468f, 0.7675f, -0.0669f);
+            clone.transform.localEulerAngles = Vector3.zero;
+            clone.transform.localScale = new Vector3(0.5f, 0.5f, 0.5f);
+            clone.SetActive(true);
+
+            // Remove any Animation on the clone
+            foreach (var anim in clone.GetComponentsInChildren<Animation>(true))
+                UnityEngine.Object.Destroy(anim);
+
+            // Ensure collider for raycast hits
+            if (clone.GetComponent<Collider>() == null)
+            {
+                var mf = clone.GetComponentInChildren<MeshFilter>();
+                var bc = clone.AddComponent<BoxCollider>();
+                if (mf != null && mf.sharedMesh != null)
+                {
+                    var b = mf.sharedMesh.bounds;
+                    bc.center = b.center;
+                    bc.size = b.size;
+                }
+            }
+
+            // Add interaction components (default keypress UI) + range
+            var intObj = clone.GetComponent<InteractableObject>() ?? clone.AddComponent<InteractableObject>();
+            intObj.SetInteractionType(InteractableObject.EInteractionType.Key_Press);
+            intObj.MaxInteractionRange = 2f;
+
+            var toggle = clone.GetComponent<InteractableToggleable>() ?? clone.AddComponent<InteractableToggleable>();
+            toggle.IntObj = intObj; // required reference
+
+            // ---- Clone Phone_Raised from ROOT (no parent) if present ----
+            Transform phoneRaisedSrc = FindRootByName("Phone_Raised");
+            GameObject phoneRaised;
+            if (phoneRaisedSrc != null)
+            {
+                phoneRaised = UnityEngine.Object.Instantiate(phoneRaisedSrc.gameObject);
+                phoneRaised.name = "Phone_Raised";
+                phoneRaised.transform.SetParent(clone.transform, false);
+                // place it where you wanted
+                phoneRaised.transform.localPosition = new Vector3(-0.0003f, 0.215f, -0.088f);
+                phoneRaised.transform.localEulerAngles = Vector3.zero;
+                phoneRaised.transform.localScale = new Vector3(1.5f, 1.5f, 1.5f);
+                foreach (var a in phoneRaised.GetComponentsInChildren<Animation>(true))
+                    UnityEngine.Object.Destroy(a);
+                phoneRaised.SetActive(false);
+            }
+            else
+            {
+                // Fallback empty container
+                phoneRaised = new GameObject("Phone_Raised");
+                phoneRaised.transform.SetParent(clone.transform, false);
+                phoneRaised.transform.localPosition = new Vector3(-0.0003f, 0.215f, -0.088f);
+                phoneRaised.transform.localEulerAngles = Vector3.zero;
+                phoneRaised.transform.localScale = new Vector3(1.5f, 1.5f, 1.5f);
+                phoneRaised.SetActive(false);
+            }
+
+            // Charging logic host (self-binds in Awake)
+            clone.AddComponent<GameConsoleCharge>();
+
+            // --------------------------- BEGIN PATCH: ChargingLight clone ---------------------------
+            // Clone the Mixing Station light and parent under our console clone.
+            // Path: "MixingStationMk2_Built/Mixing Station/Mixing station/Head/Light"
+            const string LightSrcPath = "MixingStationMk2_Built/Mixing Station/Mixing station/Head/Light";
+            var lightSrc = FindByPathLoose(LightSrcPath);
+            if (lightSrc != null)
+            {
+                var lightClone = UnityEngine.Object.Instantiate(lightSrc.gameObject);
+                lightClone.name = "ChargingLight";
+                lightClone.transform.SetParent(clone.transform, false);
+
+                // Requested local TRS
+                lightClone.transform.localScale = new Vector3(0.5f, 0.5f, 0.5f);
+                lightClone.transform.localPosition = new Vector3(-0.2599f, 0.1419f, -0.1503f);
+                lightClone.transform.localEulerAngles = new Vector3(270f, 0f, 0f);
+
+                // Spawn ON-Object but OFF-Light
+                var tl = lightClone.GetComponentInChildren<ScheduleOne.Misc.ToggleableLight>(true);
+                if (tl != null) tl.isOn = false;
+            }
+            else
+            {
+                MelonLogger.Warning("[GameConsoleCharging] Could not find Mixing Station Light to clone.");
+            }
+            // ---------------------------- END PATCH: ChargingLight clone ----------------------------
+
+            // Adjust the nearby TV_Built/IntObj transform (your values)
+            var near = FindByPathLoose(NearbyIntObjPath);
+            if (near != null)
+            {
+                near.localPosition = new Vector3(-0.0103f, 1.3334f, -0.1941f);
+                near.localEulerAngles = Vector3.zero;
+                near.localScale = new Vector3(1.2744f, 0.8525f, 0.0313f);
+            }
+        }
+
+        // Find a ROOT-level object (no parent) by name, including inactive objects
+        private static Transform FindRootByName(string name)
+        {
+            var all = Resources.FindObjectsOfTypeAll<Transform>();
+            for (int i = 0; i < all.Length; i++)
+            {
+                var t = all[i];
+                if (t != null && t.parent == null && string.Equals(t.name, name, StringComparison.Ordinal))
+                    return t;
+            }
+            return null;
+        }
+
+        // Inactive/nested suffix-path search
+        private static Transform FindByPathLoose(string targetPath)
+        {
+            var want = targetPath.Split('/');
+            int n = want.Length;
+
+            var all = Resources.FindObjectsOfTypeAll<Transform>();
+            for (int i = 0; i < all.Length; i++)
+            {
+                var t = all[i];
+                if (t == null || t.name != want[n - 1]) continue;
+
+                // verify suffix chain
+                int k = n - 1;
+                Transform cur = t;
+                while (k >= 0 && cur != null && string.Equals(cur.name, want[k], StringComparison.Ordinal))
+                {
+                    cur = cur.parent;
+                    k--;
+                }
+                if (k < 0) return t;
+            }
+            return null;
+        }
+    }
+
+    // ----------------------------------------------------------------------------
+    // Charging logic + GUID ownership lock
+    // ----------------------------------------------------------------------------
+    public class GameConsoleCharge : MonoBehaviour
+    {
+        private InteractableToggleable _toggle;
+        private InteractableObject _intObj;
+        private Coroutine _chargeRoutine;
+        private GameObject _phoneRaised; // child visual toggled only on this console
+        private ScheduleOne.Misc.ToggleableLight _chargingLight; // child light we flip on/off
+        private Guid _ownerGuid = Guid.Empty;
+
+        // Tracks whether we were the ones who hid the Phone GO due to proximity.
+        private bool _phoneGateToggled = false;
+
+        // Cached reference to the Phone GO so we don't search every frame.
+        private UnityEngine.GameObject _phoneGO = null;
+
+
+        // Cache references and ensure visuals start off
+        private void Awake()
+        {
+            _toggle = GetComponent<InteractableToggleable>();
+            _intObj = GetComponent<InteractableObject>();
+            if (_toggle == null || _intObj == null) return;
+
+            // Cache the child visual (created during SetupRoutine)
+            var t = transform.Find("Phone_Raised");
+            _phoneRaised = t != null ? t.gameObject : null;
+            if (_phoneRaised != null)
+                _phoneRaised.SetActive(false); // ensure off at start
+
+            // Cache the cloned ChargingLight
+            var ltTr = transform.Find("ChargingLight");
+            if (ltTr != null)
+                _chargingLight = ltTr.GetComponent<ScheduleOne.Misc.ToggleableLight>()
+                                 ?? ltTr.GetComponentInChildren<ScheduleOne.Misc.ToggleableLight>(true);
+            if (_chargingLight != null)
+                _chargingLight.isOn = false; // start dark but enabled
+
+            // Capture & cache the GUID for the placed TV this console belongs to
+            TryCaptureOwnerGuid();
+
+            // Bind here so we never miss it
+            _toggle.onActivate.AddListener(StartCharging);
+            _toggle.onDeactivate.AddListener(StopCharging);
+
+            // Bind our hover AFTER the game's InteractableToggleable.Start() adds its own handler.
+            // We do this one frame later to ensure our callback runs last and can override text.
+            StartCoroutine(BindHoverNextFrame());
+        }
+
+        private IEnumerator BindHoverNextFrame()
+        {
+            yield return null; // let InteractableToggleable.Start() run first
+            if (_intObj != null)
+                _intObj.onHovered.AddListener(ApplyDynamicHoverText);
+        }
+
+        // Attempts to read a persistent GUID from any parent that exposes a Guid "GUID" property.
+        // Works with objects implementing the game's IGUIDRegisterable without hard type refs.
+        private void TryCaptureOwnerGuid()
+        {
+            _ownerGuid = Guid.Empty;
+
+            var parents = GetComponentsInParent<Component>(true);
+            for (int i = 0; i < parents.Length; i++)
+            {
+                var c = parents[i];
+                if (c == null) continue;
+
+                var tp = c.GetType();
+                var prop = tp.GetProperty("GUID", BindingFlags.Public | BindingFlags.Instance);
+                if (prop != null && prop.PropertyType == typeof(Guid))
+                {
+                    var val = prop.GetValue(c, null);
+                    if (val is Guid g && g != Guid.Empty)
+                    {
+                        _ownerGuid = g;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Builds dynamic strings and forces them onto the crosshair (runs on hover)
+        private void ApplyDynamicHoverText()
+        {
+            if (_toggle == null || _intObj == null) return;
+
+            int pct = Mathf.Clamp(Mathf.RoundToInt(PhoneBattery.CurrentBatteryLevel), 0, 100);
+            string redPct = $"<color=#FF5555>{pct}%</color>";
+            string greenPct = $"<color=#55FF55>{pct}%</color>";
+            string alreadyGeneric = $"<color=#FFD966>Already charging!</color> {greenPct}";
+            string alreadyConsole = $"<color=#FFD966>Already charging!</color> {greenPct}";
+            string fullyCharged = $"<color=#55FF55>Fully charged!</color> {greenPct}";
+
+            // Determine if THIS console is the owner; otherwise treat as "other console"
+            bool isOwner;
+            if (GameConsole.ActiveOwnerGuid != Guid.Empty && _ownerGuid != Guid.Empty)
+                isOwner = (GameConsole.ActiveOwnerGuid == _ownerGuid);
+            else
+                isOwner = (_chargeRoutine != null); // fallback owner check within session
+
+            // If any charging is active and we're NOT the owner, always show "Already charging!"
+            if (GameConsole.IsCharging && !isOwner)
+            {
+                _toggle.ActivateMessage = alreadyConsole;
+                _toggle.DeactivateMessage = alreadyConsole;
+
+                _intObj.SetMessage(alreadyConsole);
+                _intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+                return;
+            }
+
+            // Power bank blocks console usage (generic)
+            if (PowerbankCharging.IsCharging)
+            {
+                _toggle.ActivateMessage = alreadyGeneric;
+                _toggle.DeactivateMessage = alreadyGeneric;
+
+                _intObj.SetMessage(alreadyGeneric);
+                _intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+                return;
+            }
+
+            // Owner + battery full => keep locked, show "Fully charged!"
+            if (GameConsole.IsCharging && isOwner && PhoneBattery.CurrentBatteryLevel >= 100f)
+            {
+                _toggle.ActivateMessage = fullyCharged;
+                _toggle.DeactivateMessage = fullyCharged;
+                _intObj.SetMessage(fullyCharged);
+                _intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+                return;
+            }
+
+            // Normal labels
+            _toggle.ActivateMessage = $"Charge phone {redPct}";
+            _toggle.DeactivateMessage = $"Stop charging {greenPct}";
+
+            // Apply the appropriate message for current state
+            _intObj.SetMessage(_toggle.IsActivated ? _toggle.DeactivateMessage : _toggle.ActivateMessage);
+            _intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+        }
+
+        // Only updates texts while this object is hovered
+        private void Update()
+        {
+            if (_toggle == null || _intObj == null)
+                return;
+
+            // Only do work if THIS interactable is currently hovered
+            var im = Singleton<InteractionManager>.Instance;
+            if (im == null || im.HoveredInteractableObject != _intObj)
+                return;
+
+            int pct = Mathf.Clamp(Mathf.RoundToInt(PhoneBattery.CurrentBatteryLevel), 0, 100);
+            string redPct = $"<color=#FF5555>{pct}%</color>";
+            string greenPct = $"<color=#55FF55>{pct}%</color>";
+            string alreadyGeneric = $"<color=#FFD966>Already charging!</color>";
+            string alreadyConsole = $"<color=#FFD966>Already charging!</color> {greenPct}";
+            string fullyCharged = $"<color=#55FF55>Fully charged!</color>";
+
+            bool isOwner;
+            if (GameConsole.ActiveOwnerGuid != Guid.Empty && _ownerGuid != Guid.Empty)
+                isOwner = (GameConsole.ActiveOwnerGuid == _ownerGuid);
+            else
+                isOwner = (_chargeRoutine != null); // fallback
+
+            if (GameConsole.IsCharging && !isOwner)
+            {
+                _toggle.ActivateMessage = alreadyConsole;
+                _toggle.DeactivateMessage = alreadyConsole;
+                _intObj.SetMessage(alreadyConsole);
+                return;
+            }
+
+            if (PowerbankCharging.IsCharging)
+            {
+                _toggle.ActivateMessage = alreadyGeneric;
+                _toggle.DeactivateMessage = alreadyGeneric;
+                _intObj.SetMessage(alreadyGeneric);
+                return;
+            }
+
+            if (GameConsole.IsCharging && isOwner && PhoneBattery.CurrentBatteryLevel >= 100f)
+            {
+                _toggle.ActivateMessage = fullyCharged;
+                _toggle.DeactivateMessage = fullyCharged;
+                _intObj.SetMessage(fullyCharged);
+                return;
+            }
+
+            // Normal labels
+            _toggle.ActivateMessage = $"Charge phone {redPct}";
+            _toggle.DeactivateMessage = $"Stop charging {greenPct}";
+
+            // Force-apply in case a prior listener wrote defaults this frame.
+            _intObj.SetMessage(_toggle.IsActivated ? _toggle.DeactivateMessage : _toggle.ActivateMessage);
+        }
+
+        // Enforce 2f proximity to THIS owner console while charging.
+        // Hides the Phone GO when farther than 2f, restores it when back within 2f,
+        // but only if we were the ones who hid it.
+        private void LateUpdate()
+        {
+            // Must be charging AND this console must be the current owner.
+            if (!ScheduleOne.PhoneBattery.GameConsole.IsCharging ||
+                ScheduleOne.PhoneBattery.GameConsole.ActiveOwnerGuid == System.Guid.Empty)
+                return;
+
+            bool isOwner = (ScheduleOne.PhoneBattery.GameConsole.ActiveOwnerGuid == _ownerGuid);
+            if (!isOwner)
+                return;
+
+            var cam = ScheduleOne.DevUtilities.PlayerSingleton<ScheduleOne.PlayerScripts.PlayerCamera>.Instance;
+            if (cam == null)
+                return;
+
+            float dist = UnityEngine.Vector3.Distance(cam.transform.position, this.transform.position);
+            var phoneGO = ResolvePhoneGO();
+            if (phoneGO == null)
+                return;
+
+            // Farther than 2f: hide Phone GO if currently active
+            if (dist > 2f)
+            {
+                if (phoneGO.activeSelf)
+                {
+                    phoneGO.SetActive(false);
+                    _phoneGateToggled = true;
+                }
+                return;
+            }
+
+            // Within 2f: restore Phone GO only if we hid it
+            if (_phoneGateToggled && !phoneGO.activeSelf)
+            {
+                phoneGO.SetActive(true);
+                _phoneGateToggled = false;
+            }
+        }
+
+
+        // Resolve and cache /Player_Local/CameraContainer/Camera/OverlayCamera/GameplayMenu/Phone
+        private UnityEngine.GameObject ResolvePhoneGO()
+        {
+            if (_phoneGO != null) return _phoneGO;
+
+            var root = UnityEngine.GameObject.Find("Player_Local");
+            if (root == null) return null;
+
+            var t = root.transform.Find("CameraContainer/Camera/OverlayCamera/GameplayMenu/Phone/phone");
+            if (t == null) return null;
+
+            _phoneGO = t.gameObject;
+            return _phoneGO;
+        }
+
+
+        // ---- Start/Stop with your power-bank early-return guard and light toggles ----
+
+        public void StartCharging()
+        {
+            if (_chargeRoutine != null) return;
+
+            bool blockedByOtherConsole =
+                GameConsole.IsCharging &&
+                GameConsole.ActiveOwnerGuid != Guid.Empty &&
+                (_ownerGuid == Guid.Empty || GameConsole.ActiveOwnerGuid != _ownerGuid);
+
+            // Block if another console already owns the GUID lock
+            if (blockedByOtherConsole)
+            {
+                if (_intObj != null)
+                {
+                    int pct = Mathf.Clamp(Mathf.RoundToInt(PhoneBattery.CurrentBatteryLevel), 0, 100);
+                    string greenPct = $"<color=#55FF55>{pct}%</color>";
+                    string alreadyConsole = $"<color=#FFD966>Already charging!</color> {greenPct}";
+
+                    _toggle.ActivateMessage = alreadyConsole;
+                    _toggle.DeactivateMessage = alreadyConsole;
+                    _intObj.SetMessage(alreadyConsole);
+                    _intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+                }
+                return;
+            }
+
+            // *** Your fixed power-bank guard (messages + return) ***
+            if (PowerbankCharging.IsCharging)
+            {
+                if (_intObj != null)
+                {
+                    int pct = Mathf.Clamp(Mathf.RoundToInt(PhoneBattery.CurrentBatteryLevel), 0, 100);
+                    string greenPct = $"<color=#55FF55>{pct}%</color>";
+                    string msg = $"<color=#FFD966>Already charging!</color> {greenPct}";
+                    _toggle.ActivateMessage = msg;
+                    _toggle.DeactivateMessage = msg;
+                    _intObj.SetMessage(msg);
+                    _intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+                }
+                return;
+            }
+
+            // If already full, snap back to off (this console’s own state)
+            if (PhoneBattery.CurrentBatteryLevel >= 100f)
+            {
+                if (_toggle.IsActivated)
+                    _toggle.SetState(false);
+                return;
+            }
+
+            // Assign an owner (session GUID if needed)
+            if (_ownerGuid == Guid.Empty)
+                _ownerGuid = Guid.NewGuid();
+
+            GameConsole.ActiveOwnerGuid = _ownerGuid;
+            GameConsole.IsCharging = true;
+
+            // Show the phone prop on THIS console
+            if (_phoneRaised != null)
+                _phoneRaised.SetActive(true);
+
+            // Light ON for owner console
+            if (_chargingLight != null)
+                _chargingLight.isOn = true;
+
+            _chargeRoutine = StartCoroutine(ChargeLoop());
+        }
+
+        public void StopCharging()
+        {
+            // Only the active/owner console is allowed to stop the global charge.
+            bool isOwner = (ScheduleOne.PhoneBattery.GameConsole.ActiveOwnerGuid == System.Guid.Empty && _chargeRoutine != null)
+                           || (ScheduleOne.PhoneBattery.GameConsole.ActiveOwnerGuid != System.Guid.Empty
+                               && ScheduleOne.PhoneBattery.GameConsole.ActiveOwnerGuid == _ownerGuid);
+
+            if (!isOwner)
+                return;
+
+            if (_chargeRoutine != null)
+            {
+                StopCoroutine(_chargeRoutine);
+                _chargeRoutine = null;
+            }
+
+            ScheduleOne.PhoneBattery.GameConsole.IsCharging = false;
+            ScheduleOne.PhoneBattery.GameConsole.ActiveOwnerGuid = System.Guid.Empty;
+
+            // Hide the phone prop
+            if (_phoneRaised != null)
+                _phoneRaised.SetActive(false);
+
+            // Light OFF
+            if (_chargingLight != null)
+                _chargingLight.isOn = false;
+
+            // NEW from proximity patch: If we hid the Phone GO due to distance, restore it now.
+            if (_phoneGateToggled)
+            {
+                var phoneGO = ResolvePhoneGO();
+                if (phoneGO != null)
+                    phoneGO.SetActive(true);
+                _phoneGateToggled = false;
+            }
+        }
+
+
+
+
+        private void OnDestroy()
+        {
+            // If this object owned the charging lock, clear it so others can be used.
+            if (GameConsole.IsCharging)
+            {
+                bool isOwner = (GameConsole.ActiveOwnerGuid != Guid.Empty && _ownerGuid != Guid.Empty)
+                               ? (GameConsole.ActiveOwnerGuid == _ownerGuid)
+                               : (_chargeRoutine != null);
+
+                if (isOwner)
+                {
+                    if (_chargeRoutine != null)
+                    {
+                        StopCoroutine(_chargeRoutine);
+                        _chargeRoutine = null;
+                    }
+
+                    GameConsole.IsCharging = false;
+                    GameConsole.ActiveOwnerGuid = Guid.Empty;
+
+                    if (_phoneRaised != null)
+                        _phoneRaised.SetActive(false);
+
+                    if (_chargingLight != null)
+                        _chargingLight.isOn = false;
+                }
+            }
+        }
+
+        private System.Collections.IEnumerator ChargeLoop()
+        {
+            // Charge until full or toggle off; when full, LATCH the state (keep lock/visuals)
+            while (_toggle != null && _toggle.IsActivated && PhoneBattery.CurrentBatteryLevel < 100f)
+            {
+                var tm = NetworkSingleton<TimeManager>.Instance;
+                float timeMult = tm != null ? tm.TimeProgressionMultiplier : 0f;
+                if (timeMult > 0f)
+                {
+                    // ~100% per in-game hour
+                    float chargePerSecond = (100f / 1f) / 60f;
+                    PhoneBattery.CurrentBatteryLevel =
+                        Mathf.Clamp(PhoneBattery.CurrentBatteryLevel + (Time.deltaTime * timeMult) * chargePerSecond, 0f, 100f);
+                }
+                yield return null;
+            }
+
+            // We exit either because the toggle was turned off, or battery reached 100%.
+            bool reachedFull = PhoneBattery.CurrentBatteryLevel >= 100f;
+
+            _chargeRoutine = null;
+
+            if (reachedFull && _toggle != null && _toggle.IsActivated)
+            {
+                // --- LATCHED FULL-CHARGE STATE ---
+                // Keep global console lock and visuals ON until the player interacts to stop.
+                // (This preserves "Fully charged!" hover + forces the player to walk back to the console.)
+                if (_phoneRaised != null)
+                    _phoneRaised.SetActive(true);
+
+                if (_chargingLight != null)
+                    _chargingLight.isOn = true;
+
+                // IMPORTANT:
+                // - DO NOT clear GameConsole.IsCharging or ActiveOwnerGuid here.
+                // - Leaving the coroutine maintains the locked/latched state:
+                //   * Hover text shows "Fully charged!"
+                //   * 2f proximity phone-visibility rule continues to apply
+                yield break;
+            }
+
+            // --- Normal cleanup path (user turned it off or interrupted before full) ---
+            bool isOwner = (GameConsole.ActiveOwnerGuid == System.Guid.Empty)
+                           || (GameConsole.ActiveOwnerGuid == _ownerGuid);
+
+            if (isOwner)
+            {
+                GameConsole.IsCharging = false;
+                GameConsole.ActiveOwnerGuid = System.Guid.Empty;
+            }
+
+            // Hide the phone prop
+            if (_phoneRaised != null)
+                _phoneRaised.SetActive(false);
+
+            // Light OFF when loop ends without reaching full
+            if (_chargingLight != null)
+                _chargingLight.isOn = false;
+
+            // If toggle is still on and we didn't reach full, snap back to OFF
+            if (_toggle != null && _toggle.IsActivated && PhoneBattery.CurrentBatteryLevel < 100f)
+                _toggle.SetState(false);
+        }
+
+    }
+
+    // ----------------------------------------------------------------------------
+    // Global console charge state keyed by placed TV's GUID
+    // ----------------------------------------------------------------------------
+    public static class GameConsole
+    {
+        // Read by other systems; written by the console charger.
+        public static bool IsCharging { get; internal set; }
+        public static Guid ActiveOwnerGuid { get; internal set; } = Guid.Empty;
+    }
+
+    // (Optional compatibility shim — keep temporarily if any other file still references TVcharge)
+    [Obsolete("Use GameConsole.IsCharging")]
+    public static class TVcharge
+    {
+        public static bool IsCharging
+        {
+            get => GameConsole.IsCharging;
+            internal set => GameConsole.IsCharging = value;
+        }
+    }
+
+    // ----------------------------------------------------------------------------
+    // Hard veto: prevent non-owner consoles from toggling while a console owns the lock
+    // Also veto when the power bank is actively charging (prevents zombie "ON" state").
+    // ----------------------------------------------------------------------------
+    [HarmonyPatch(typeof(InteractableToggleable), nameof(InteractableToggleable.Toggle))]
+    [HarmonyPriority(Priority.First)]
+    internal static class GameConsole_ToggleVetoPatch
+    {
+        static bool Prefix(InteractableToggleable __instance)
+        {
+            // Only gate our custom console clones
+            var console = __instance.GetComponent<GameConsoleCharge>();
+            if (console == null) return true;
+
+            // NEW: If power bank is charging, veto this toggle so IsActivated never flips
+            if (PowerbankCharging.IsCharging)
+            {
+                var intObj = __instance.IntObj;
+                if (intObj != null)
+                {
+                    int pct = Mathf.Clamp(Mathf.RoundToInt(PhoneBattery.CurrentBatteryLevel), 0, 100);
+                    string msg = $"<color=#FFD966>Already charging!</color> <color=#55FF55>{pct}%</color>";
+                    __instance.ActivateMessage = msg;
+                    __instance.DeactivateMessage = msg;
+                    intObj.SetMessage(msg);
+                    intObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+                }
+                return false; // veto: do not flip the toggle ON
+            }
+
+            // No console charging yet? Allow toggling freely.
+            if (!GameConsole.IsCharging)
+                return true;
+
+            // Determine ownership in the simplest way possible
+            var ownerGuidField = typeof(GameConsoleCharge).GetField("_ownerGuid",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var chargeRoutineField = typeof(GameConsoleCharge).GetField("_chargeRoutine",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            Guid thisGuid = ownerGuidField != null ? (Guid)ownerGuidField.GetValue(console) : Guid.Empty;
+            bool isOwner;
+            if (GameConsole.ActiveOwnerGuid != Guid.Empty && thisGuid != Guid.Empty)
+                isOwner = (thisGuid == GameConsole.ActiveOwnerGuid);
+            else
+                isOwner = (chargeRoutineField != null && chargeRoutineField.GetValue(console) != null);
+
+            if (isOwner) return true; // owner may toggle
+
+            // Non-owner: veto toggle and show the simplified message
+            var nonOwnerIntObj = __instance.IntObj;
+            if (nonOwnerIntObj != null)
+            {
+                int pct = Mathf.Clamp(Mathf.RoundToInt(PhoneBattery.CurrentBatteryLevel), 0, 100);
+                string msg = $"<color=#FFD966>Already charging!</color> <color=#55FF55>{pct}%</color>";
+                __instance.ActivateMessage = msg;
+                __instance.DeactivateMessage = msg;
+                nonOwnerIntObj.SetMessage(msg);
+                nonOwnerIntObj.SetInteractableState(InteractableObject.EInteractableState.Default);
+            }
+            return false;
+        }
+    }
+}
